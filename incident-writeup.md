@@ -36,7 +36,7 @@ The scenario mirrors a typical intrusion in which each stage follows logically f
 | 1 | Ingress Tool Transfer | T1105 | 4688 | **100100** (custom) | 12 |
 | 2 | Execution / Discovery | T1059.001 / T1057 | 4104 | 91815 | 4 |
 | 3 | Persistence | T1053.005 | 4698 | 60228 | 4 |
-| 4 | Privilege Escalation | T1136.001 / T1098 | 4720 / 4732 | 92039 / 92033 | 3 |
+| 4 | Privilege Escalation | T1136.001 / T1098 (Wazuh: t1087 — misclassified, see analysis)| 4720 / 4732 | 92039 / 92033 | 3 |
 | 5 | Defense Evasion | T1070.001 | 1102 | 63103 | 5 |
 
 ---
