@@ -49,7 +49,8 @@ Built as part of my hands-on preparation for a SOC Analyst role. All activity wa
 
 | File | Description |
 |---|---|
-| [`incident-writeup.md`](incident-writeup.md) | Full incident writeup: attack chain, timeline, per-stage analysis, analyst findings |
+| [`incident-writeup-windows.md`](incident-writeup-windows.md) | Full incident writeup for windows server: attack chain, timeline, per-stage analysis, analyst findings |
+| [`incident-writeup-linux.md`](incident-writeup-linux.md) | Linux attacks (3 techniques), analysis, custom rule 100200, root-cause 
 | [`detection/local_rules.xml`](detection/local_rules.xml) | Custom Wazuh detection rule (T1105 — certutil LOLBin abuse) |
 | [`screenshots/`](screenshots/) | Folder with dashboards captures per stage |
 ---
