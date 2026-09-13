@@ -1,0 +1,51 @@
+<!--
+  Wazuh - local custom detection rules
+  Target path on the server: /var/ossec/etc/rules/local_rules.xml
+
+  Two custom rules written for this lab, each closing a gap where the default
+  ruleset detected activity but did not raise an actionable alert.
+
+  Rule 100100 (Windows): certutil abused as a LOLBin to download files (T1105).
+  Rule 100200 (Linux):   suspicious tool execution captured by auditd (T1059.004).
+-->
+
+<!-- ===== Windows: certutil LOLBin download (T1105) ===== -->
+<!--
+  The default ruleset detected only the RESULT (an executable dropped in a
+  folder commonly used by malware, rule 92213), not the TECHNIQUE. This rule
+  detects the behavioural pattern regardless of where the file lands.
+-->
+<group name="windows,attack,custom,">
+
+  <rule id="100100" level="12">
+    <if_sid>67027</if_sid>
+    <field name="win.eventdata.newProcessName" type="pcre2">(?i)certutil\.exe$</field>
+    <field name="win.eventdata.commandLine" type="pcre2">(?i)urlcache|verifyctl</field>
+    <description>LOLBin abuse: certutil downloading a file from the network (MITRE T1105)</description>
+    <mitre>
+      <id>T1105</id>
+    </mitre>
+  </rule>
+
+</group>
+
+<!-- ===== Linux: suspicious tool execution via auditd (T1059.004) ===== -->
+<!--
+  auditd records execution of watched binaries (key: suspicious_exec) but the
+  default ruleset classifies them under rule 80700 at level 0 (no alert).
+  This rule raises them to an actionable alert. Requires an auditd execve
+  watch on the endpoint, e.g.:
+    auditctl -a always,exit -F arch=b64 -S execve -F exe=$(which curl) -k suspicious_exec
+-->
+<group name="audit,attack,custom,">
+
+  <rule id="100200" level="10">
+    <if_sid>80700</if_sid>
+    <field name="audit.key">suspicious_exec</field>
+    <description>Suspicious tool execution on Linux via audited binary (key: $(audit.key)) - MITRE T1059.004</description>
+    <mitre>
+      <id>T1059.004</id>
+    </mitre>
+  </rule>
+
+</group>
